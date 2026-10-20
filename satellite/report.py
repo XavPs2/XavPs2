@@ -10,6 +10,7 @@ import math
 import numpy as np
 import pandas as pd
 from rotation_satellite import TICKERS, FEE, KILL, load, run
+from meanrev import run_meanrev
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -21,7 +22,12 @@ def fnum(x, nd=2):
 def build(a):
     px = load(TICKERS, a.start)
     stocks = px.drop(columns="SPY")
-    eq, jr, inmkt = run(px, a.start, a.capital, a.stop)
+    mr = a.strategy == "meanrev"
+    if mr:
+        eq, jr, inmkt = run_meanrev(px, a.start, a.capital, a.rsi_n, a.thr, a.sma, a.mstop, a.maxd, a.slots)
+    else:
+        eq, jr, inmkt = run(px, a.start, a.capital, a.stop)
+    stop_used = a.mstop if mr else a.stop
     spy = px["SPY"].reindex(eq.index).ffill()
     bh = spy / spy.iloc[0] * a.capital
 
@@ -38,8 +44,12 @@ def build(a):
         rel = p / p.iloc[0] - 1
         mae.append(rel.min()); mfe.append(rel.max())
         step = max(1, len(p) // 250)
+        if mr:
+            sl = [round(t["entry_price"] * (1 - stop_used), 2)] * len(p) if stop_used < 1 else [None] * len(p)
+        else:
+            sl = [round(v * (1 - stop_used), 2) for v in p.cummax()]
         paths.append({"t": [d.strftime("%Y-%m-%d") for d in p.index[::step]],
-                      "p": [round(v, 2) for v in p.values[::step]]})
+                      "p": [round(v, 2) for v in p.values[::step]], "s": sl[::step]})
     tr["mae"], tr["mfe"] = mae, mfe
 
     # --- métriques sur la courbe d'équité quotidienne
@@ -86,6 +96,12 @@ def build(a):
         d = t["exit_dt"]
         cal.setdefault(d.year, {}).setdefault(d.month, []).append(t["net"])
     calendar = {}
+    if mr:
+        mret = eq.resample('ME').last().pct_change()
+        mret.iloc[0] = eq.resample('ME').last().iloc[0] / a.capital - 1
+        cal = {}
+        for d, v in mret.items():
+            cal.setdefault(d.year, {}).setdefault(d.month, []).append(float(v))
     for y, ms in cal.items():
         row = {}
         for m, v in ms.items():
@@ -99,6 +115,8 @@ def build(a):
 
     def excl(n, best):
         s = tr.sort_values("net", ascending=not best)
+        if mr:
+            return float((eq.iloc[-1] - s["pnl"].iloc[:n].sum()) / a.capital - 1)
         return float((1 + tr.drop(s.index[:n])["net"]).prod() - 1)
 
     reasons = {}
@@ -119,7 +137,15 @@ def build(a):
         for i, (_, t) in enumerate(tr.iterrows())]
     kept = [int(y) for y in jr[jr["entry_date"] == "(gardé)"]["year"]]
     return dict(
-        params=dict(start=a.start, capital=a.capital, stop=a.stop, fee=FEE, kill=KILL, tickers=TICKERS, kept=kept,
+        params=dict(start=a.start, capital=a.capital, stop=stop_used, fee=FEE, kill=KILL, tickers=TICKERS, kept=kept,
+                    strategy=a.strategy, slots=a.slots, prevlabel="RSI SIGNAL" if mr else "RDT ANNÉE PRÉC.",
+                    title="REPLI RSI" if mr else "ROTATION",
+                    rules=dict(
+                        entry=[f"RSI({a.rsi_n}) < {a.thr} la veille et clôture > SMA200 : achat à la clôture suivante, max {a.slots} positions (capital ÷ {a.slots} chacune)",
+                               ] if mr else ["1er jour de bourse de janvier : 100 % sur le meilleur rendement total de l'année précédente"],
+                        exit=([f"Clôture > SMA{a.sma}", f"Durée max {a.maxd} jours"] + ([f"Stop {a.mstop:.0%} sous l'entrée"] if a.mstop < 1 else []) + ["Frais 0,05 % par côté"]) if mr else
+                             [f"Clôture ≤ {100 - a.stop * 100:.0f} % du plus haut depuis l'entrée → cash jusqu'en janvier", "Rotation en janvier (sauf si même gagnant)", f"Valeur ≤ {KILL * 100:.0f} % du capital initial → arrêt"]),
+                    rerun=("python report.py --strategy meanrev" if mr else "python report.py --strategy rotation") ,
                     period=f"{eq.index[0].date()} – {eq.index[-1].date()}"),
         head=dict(ret=fnum((eq.iloc[-1] / eq.iloc[0] - 1) * 100, 1), win=fnum(wr * 100, 1), trades=len(tr)),
         score=dict(score=score, letter=letter, prof=round(prof), risk=round(risk), cons=round(cons), edge=round(edge)),
@@ -140,7 +166,7 @@ def build(a):
         seas=[fnum(np.mean(seas[m]) * 100, 1) if seas[m] else None for m in range(1, 13)],
         seas_n=[len(seas[m]) for m in range(1, 13)],
         hist=dict(h=[int(x) for x in hist], e=[round(float(x), 1) for x in edges]),
-        reasons=reasons, trades=trades)
+        reasons=reasons, trades=trades[-100:], ntrades=len(trades))
 
 
 HTML = r"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
@@ -193,9 +219,9 @@ table.t{width:100%;border-collapse:collapse;font-size:12px}.t th{color:var(--mut
 <header><b>◆ SATELLITE</b><div class="tabs"><span class="on">Terminal</span><span>Journal</span></div></header>
 <div class="wrap"><aside>
 <h4>ACTIVE QUERY</h4><div class="q" id="qbox"></div>
-<h4>ENTRY</h4><div class="rule">1er jour de bourse de janvier : 100 % sur le meilleur rendement total de l'année précédente<i>LONG</i></div>
-<h4>EXIT</h4><div class="rule x" id="rx"></div><div class="rule x">Rotation en janvier (sauf si même gagnant)<i>ROT</i></div><div class="rule x" id="rk"></div>
-<h4>RERUN</h4><div class="q">python report.py --start 2001 --capital 10000 --stop 0.35</div>
+<h4>ENTRY</h4><div id="re"></div>
+<h4>EXIT</h4><div id="rx"></div>
+<h4>RERUN</h4><div class="q" id="rr"></div>
 </aside><main id="m"></main></div>
 <script>
 const D=__DATA__;
@@ -203,13 +229,15 @@ const $=s=>document.querySelector(s),f=(x,d=2,suf='')=>x==null?'–':Number(x).t
 const cls=x=>x==null?'':x>=0?'up':'dn',sg=(x,d=1,s='%')=>x==null?'–':(x>=0?'+':'')+Number(x).toFixed(d)+s;
 const P=D.params,M=D.m,S=D.score;
 $('#qbox').innerHTML=`<span class="chip">${P.tickers.length} titres</span><span class="chip">1d</span><span class="chip">${P.period}</span><span class="chip">Long</span><span class="chip">Capital ${P.capital.toLocaleString()} $</span><span class="chip">Frais ${P.fee} $/trans.</span><span class="chip">Stop ${(P.stop*100).toFixed(0)} % du plus haut</span><span class="chip">Kill ${(P.kill*100).toFixed(0)} %</span><div style="margin-top:8px;font-size:11px">${P.tickers.join(' · ')}</div>`;
-$('#rx').innerHTML=`Clôture ≤ ${(100-P.stop*100).toFixed(0)} % du plus haut depuis l'entrée → cash jusqu'en janvier<i>STOP</i>`;
-$('#rk').innerHTML=`Valeur du satellite ≤ ${(P.kill*100).toFixed(0)} % du capital initial → arrêt<i>KILL</i>`;
+$('#re').innerHTML=P.rules.entry.map(r=>`<div class="rule">${r}<i>LONG</i></div>`).join('');
+$('#rx').innerHTML=P.rules.exit.map(r=>`<div class="rule x">${r}</div>`).join('');
+$('#rr').textContent=P.rerun+' --start '+P.start+' --capital '+P.capital;
+document.title=P.title+' – Rapport';
 const cell=(l,v,s,c='')=>`<div class="cell"><div class="l">${l}</div><div class="v ${c}">${v}</div><div class="s">${s}</div></div>`;
 const rw=(l,v,c='')=>`<div><span>${l}</span><b class="${c}">${v}</b></div>`;
-let h=`<div class="top"><span class="big">SATELLITE</span><span>1d</span><span style="color:var(--mut)">${P.period}</span>
+let h=`<div class="top"><span class="big">SATELLITE · ${P.title}</span><span>1d</span><span style="color:var(--mut)">${P.period}</span>
 <span><span class="k">RETURN</span><b class="${cls(D.head.ret)}">${sg(D.head.ret)}</b></span><span><span class="k">WIN</span><b>${f(D.head.win,2,'%')}</b></span><span><span class="k">TRADES</span><b>${D.head.trades}</b></span></div>
-<div class="bar">● Hypothèses : entrée à la clôture du 1er jour de janvier · ${P.fee} $/transaction · fractions d'action permises · aucun impôt ni change · univers à biais de survivant</div>
+<div class="bar">● Hypothèses : entrée à la clôture du 1er jour de janvier · ${P.fee} $/transaction · fractions d'action permises · aucun impôt ni change · univers à biais de survivant${P.strategy=='meanrev'?' · calendrier basé sur la courbe de capital':''}</div>
 <div class="panel"><div class="ph"><span class="tag">METRICS</span><b>PERFORMANCE</b>${D.head.trades<30?`<span class="warn">⚠ ${D.head.trades} TRADES</span>`:''}</div>
 <div class="grid"><div class="grade"><div class="k">STRATEGY GRADE (maison)</div><div class="L ${S.score>=50?'up':'dn'}">${S.letter} <small>${S.score}/100</small></div><div class="k" style="margin-top:8px">${S.score>=65?'DEPLOY':'AVOID'}</div></div>
 ${cell('NET PROFIT',sg(M.net,0,' $'),sg(D.head.ret)+' | CAGR '+sg(M.cagr),cls(M.net))}
@@ -230,10 +258,10 @@ ${cell('KELLY',sg(M.kelly,1),M.kelly<0?'NO EDGE':'FRACTION',cls(M.kelly))}</div>
 <div class="g2"><div><div class="k">01 RETURNS OVER TIME</div><div class="k" style="margin-top:10px">NET RETURN</div><div class="big2 ${cls(D.head.ret)}">${sg(D.head.ret)}</div>BEST <b class="up">${sg(M.best)}</b> · WORST <b class="dn">${sg(M.worst)}</b><canvas id="c4" height="90" style="margin-top:10px"></canvas></div>
 <div><div class="k">02 RETURN DISTRIBUTION</div><div style="margin:8px 0">MEDIAN <b>${sg(M.med)}</b> · MEAN <b>${sg(M.mean)}</b></div><canvas id="c5" height="90"></canvas></div></div>
 <div class="g2" style="border-top:1px solid var(--line)"><div><div class="k">03 RETURN CONCENTRATION</div><div style="margin:8px 0">SANS LES 5 MEILLEURS <b class="${cls(M.ex_best)}">${sg(M.ex_best)}</b><br>SANS LES 5 PIRES <b class="${cls(M.ex_worst)}">${sg(M.ex_worst)}</b></div><div class="note">Rendement composé du satellite en retirant les trades extrêmes : mesure la dépendance à quelques coups.</div></div>
-<div><div class="k">04 WINNING &amp; LOSING STREAKS</div><div style="margin:8px 0">LONGEST WIN RUN <b class="up">${M.sw} trades</b> · LONGEST LOSS RUN <b class="dn">${M.sl} trades</b></div><div class="note">Gagnant identique gardé en ${P.kept.length} janvier : ${P.kept.join(', ')||'–'}.</div></div></div>
+<div><div class="k">04 WINNING &amp; LOSING STREAKS</div><div style="margin:8px 0">LONGEST WIN RUN <b class="up">${M.sw} trades</b> · LONGEST LOSS RUN <b class="dn">${M.sl} trades</b></div><div class="note">${P.strategy=='meanrev'?'Capital partagé entre '+P.slots+' positions maximum.':'Gagnant identique gardé en '+P.kept.length+' janvier : '+(P.kept.join(', ')||'–')+'.'}</div></div></div>
 <div style="padding:14px;border-top:1px solid var(--line)"><div class="k">06 SEASONALITY (mois de sortie)</div><canvas id="c6" height="50" style="margin-top:8px"></canvas></div></div>
 <div class="panel"><div class="ph"><span class="tag">PROFILE</span><b>TRADE PROFILE</b></div><div class="row"><div><span>AVG MAE</span><b class="dn">${sg(M.avg_mae)}</b></div><div><span>AVG MFE</span><b class="up">${sg(M.avg_mfe)}</b></div><div><span>MEDIAN HOLD</span><b>${M.med_hold} bars</b></div><div style="grid-column:span 2;gap:8px;flex-wrap:wrap;justify-content:flex-end"><span>EXITS BY REASON</span>${Object.entries(D.reasons).map(([k,v])=>`<b>${k} ${v.n} · WR ${Math.round(v.w/v.n*100)}% · ${sg(v.pnl,0,' $')}</b>`).join(' | ')}</div></div></div>
-<div class="panel"><div class="ph"><span class="tag">JOURNAL</span><b>TRADES</b><span style="color:var(--mut)">clique sur une ligne pour voir le prix</span></div><table class="t"><thead><tr><th>#</th><th>TITRE</th><th>RDT ANNÉE PRÉC.</th><th>ENTRÉE</th><th>PRIX</th><th>SORTIE</th><th>PRIX</th><th>MOTIF</th><th>NET %</th><th>P/L $</th><th>MAE</th><th>MFE</th></tr></thead><tbody id="tb"></tbody></table></div>`;
+<div class="panel"><div class="ph"><span class="tag">JOURNAL</span><b>TRADES</b><span style="color:var(--mut)">${D.ntrades>D.trades.length?D.trades.length+' derniers trades sur '+D.ntrades+' · ':''}clique sur une ligne pour voir le prix</span></div><table class="t"><thead><tr><th>#</th><th>TITRE</th><th>${P.prevlabel}</th><th>ENTRÉE</th><th>PRIX</th><th>SORTIE</th><th>PRIX</th><th>MOTIF</th><th>NET %</th><th>P/L $</th><th>MAE</th><th>MFE</th></tr></thead><tbody id="tb"></tbody></table></div>`;
 $('#m').innerHTML=h;
 Chart.defaults.color='#6f8593';Chart.defaults.borderColor='#1b2c38';Chart.defaults.font.family='ui-monospace,Menlo,Consolas,monospace';Chart.defaults.font.size=10;
 const x={ticks:{maxTicksLimit:10,autoSkip:true}};
@@ -243,10 +271,10 @@ $('#lg').onchange=e=>{c1.options.scales.y.type=e.target.checked?'logarithmic':'l
 line('#c2',[{label:'Drawdown %',data:D.eq.dd,borderColor:'#d6386a',backgroundColor:'rgba(214,56,106,.25)',fill:true,borderWidth:1}],{plugins:{legend:{display:false}}});
 const T=D.trades;let c3;
 function showTrade(i){const t=T[i];$('#sel').value=i;$('#info').textContent=`${t.tkr} · ${t.why} · ${sg(t.net)}`;
- const stopLine=t.path.p.map(()=>null);let pk=0;const peaks=t.path.p.map(p=>{pk=Math.max(pk,p);return +(pk*(1-P.stop)).toFixed(2)});
+ const peaks=t.path.s;
  if(c3)c3.destroy();c3=new Chart($('#c3'),{type:'line',data:{labels:t.path.t,datasets:[{label:t.tkr+' (prix ajusté)',data:t.path.p,borderColor:'#d5e0e6',borderWidth:1.3},{label:'Niveau de stop',data:peaks,borderColor:'#d6386a',borderDash:[4,3],borderWidth:1}]},options:{animation:false,elements:{point:{radius:0}},scales:{x}}})}
 $('#sel').innerHTML=T.map((t,i)=>`<option value="${i}">#${t.n} ${t.tkr} ${t.ein}</option>`).join('');$('#sel').onchange=e=>showTrade(+e.target.value);showTrade(T.length-1);
-$('#tb').innerHTML=T.map((t,i)=>`<tr onclick="showTrade(${i});scrollTo({top:$('#c3').offsetTop-300,behavior:'smooth'})"><td>${t.n}</td><td>${t.tkr}</td><td>${sg(t.prev)}</td><td>${t.ein}</td><td>${f(t.pin)}</td><td>${t.why=='ouverte'?'(ouverte)':t.eout}</td><td>${f(t.pout)}</td><td style="text-align:left">${t.why}</td><td class="${cls(t.net)}">${sg(t.net)}</td><td class="${cls(t.pnl)}">${sg(t.pnl,0,'')}</td><td class="dn">${sg(t.mae)}</td><td class="up">${sg(t.mfe)}</td></tr>`).join('');
+$('#tb').innerHTML=T.map((t,i)=>`<tr onclick="showTrade(${i});scrollTo({top:$('#c3').offsetTop-300,behavior:'smooth'})"><td>${t.n}</td><td>${t.tkr}</td><td>${P.strategy=='meanrev'?f(t.prev,1):sg(t.prev)}</td><td>${t.ein}</td><td>${f(t.pin)}</td><td>${t.why=='ouverte'?'(ouverte)':t.eout}</td><td>${f(t.pout)}</td><td style="text-align:left">${t.why}</td><td class="${cls(t.net)}">${sg(t.net)}</td><td class="${cls(t.pnl)}">${sg(t.pnl,0,'')}</td><td class="dn">${sg(t.mae)}</td><td class="up">${sg(t.mfe)}</td></tr>`).join('');
 const ys=Object.keys(D.cal);const col=v=>v==null?'':`background:rgba(${v>=0?'29,199,160':'214,56,106'},${Math.min(.8,Math.abs(v)/40+.12)})`;
 $('#cal').innerHTML='<tr><th></th>'+['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC','YTD'].map(m=>`<th>${m}</th>`).join('')+'</tr>'+ys.map(y=>`<tr><th>${y}</th>`+[...Array(12)].map((_,i)=>{const v=D.cal[y][i+1];return `<td style="${col(v)}">${v==null?'·':sg(v,1,'')}</td>`}).join('')+`<td class="${cls(D.cal[y].ytd)}">${sg(D.cal[y].ytd)}</td></tr>`).join('');
 new Chart($('#c4'),{type:'bar',data:{labels:T.map(t=>'#'+t.n+' '+t.tkr),datasets:[{data:T.map(t=>t.net),backgroundColor:T.map(t=>t.net>=0?'#1dc7a0':'#d6386a')}]},options:{animation:false,plugins:{legend:{display:false}}}});
@@ -256,10 +284,17 @@ new Chart($('#c6'),{type:'bar',data:{labels:['Jan','Feb','Mar','Apr','May','Jun'
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    ap.add_argument("--strategy", choices=["rotation", "meanrev"], default="rotation")
+    ap.add_argument("--rsi-n", type=int, default=5, dest="rsi_n")
+    ap.add_argument("--thr", type=float, default=20)
+    ap.add_argument("--sma", type=int, default=10)
+    ap.add_argument("--mstop", type=float, default=0.10)
+    ap.add_argument("--maxd", type=int, default=10)
+    ap.add_argument("--slots", type=int, default=5)
     ap.add_argument("--start", type=int, default=2001)
     ap.add_argument("--capital", type=float, default=10000)
     ap.add_argument("--stop", type=float, default=0.35)
     a = ap.parse_args()
     data = build(a)
-    open("report.html", "w", encoding="utf-8").write(HTML.replace("__DATA__", json.dumps(data, default=str)))
-    print("report.html écrit —", data["head"], data["score"])
+    open("report_meanrev.html" if a.strategy == "meanrev" else "report.html", "w", encoding="utf-8").write(HTML.replace("__DATA__", json.dumps(data, default=str)))
+    print("rapport écrit —", data["head"], data["score"])
