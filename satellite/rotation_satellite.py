@@ -25,13 +25,13 @@ def run(px, start_year, capital, stop_pct):
     stocks = px.drop(columns="SPY")
     last_year = px.index[-1].year
     cash, shares, tkr, peak = capital, 0.0, None, 0.0
-    killed, journal, equity = False, [], {}
+    killed, journal, equity, inmkt = False, [], {}, {}
     cur = None  # entrée en cours (ligne du journal)
 
     def close_pos(d, p, reason):
         nonlocal cash, shares, tkr, cur
         cash += shares * p - FEE
-        cur.update(exit_date=d.date(), exit_price=round(p, 2), exit_reason=reason,
+        cur.update(cap_out=cash, exit_date=d.date(), exit_price=round(p, 2), exit_reason=reason,
                    ret_pct=round((p / cur["entry_price"] - 1) * 100, 1))
         shares, tkr, cur = 0.0, None, None
 
@@ -56,12 +56,13 @@ def run(px, start_year, capital, stop_pct):
                         close_pos(d, row[tkr], "rotation")
                     p = row[winner]
                     if pd.notna(p):
+                        cap0 = cash
                         cash -= FEE
                         shares, tkr, peak = (cash) / p, winner, p
                         cash = 0.0
                         cur = dict(year=y, winner=winner, prev_year_ret_pct=round(ret[winner] * 100, 1),
                                    entry_date=d.date(), entry_price=round(p, 2), exit_date=None,
-                                   exit_price=None, exit_reason="", ret_pct=None)
+                                   exit_price=None, exit_reason="", ret_pct=None, cap_in=cap0)
                         journal.append(cur)
                 else:
                     # gagnant identique : on garde, aucune transaction
@@ -78,6 +79,7 @@ def run(px, start_year, capital, stop_pct):
                         close_pos(d, p, f"stop {stop_pct:.0%} (plus haut {peak:.2f})")
             eq = cash + (shares * row[tkr] if tkr is not None and pd.notna(row[tkr]) else 0.0)
             equity[d] = eq
+            inmkt[d] = tkr is not None
             if eq <= KILL * capital:
                 if tkr is not None:
                     close_pos(d, row[tkr], "KILL SWITCH")
@@ -88,7 +90,8 @@ def run(px, start_year, capital, stop_pct):
         cur["exit_reason"] = "ouverte"
         cur["exit_price"] = round(stocks[tkr].dropna().iloc[-1], 2)
         cur["ret_pct"] = round((cur["exit_price"] / cur["entry_price"] - 1) * 100, 1)
-    return pd.Series(equity), pd.DataFrame(journal)
+        cur["cap_out"] = shares * stocks[tkr].dropna().iloc[-1]
+    return pd.Series(equity), pd.DataFrame(journal), pd.Series(inmkt)
 
 
 def stats(eq, label):
@@ -105,11 +108,11 @@ if __name__ == "__main__":
     ap.add_argument("--stop", type=float, default=0.35)
     a = ap.parse_args()
     px = load(TICKERS, a.start)
-    eq, jr = run(px, a.start, a.capital, a.stop)
-    eq_nostop, _ = run(px, a.start, a.capital, 0.999)
+    eq, jr, _ = run(px, a.start, a.capital, a.stop)
+    eq_nostop, _, _ = run(px, a.start, a.capital, 0.999)
     spy = px["SPY"][px.index >= eq.index[0]]
     spy = spy / spy.iloc[0] * a.capital
-    jr.to_csv("journal.csv", index=False)
+    jr.drop(columns=["cap_in", "cap_out"], errors="ignore").to_csv("journal.csv", index=False)
     eq.to_csv("equity.csv", header=["equity"])
     pd.set_option("display.width", 200)
     print(jr.to_string(index=False))
