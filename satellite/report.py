@@ -5,7 +5,8 @@ Usage:
   python report.py                      # rotation  -> report.html
   python report.py --strategy meanrev   # repli RSI sur 25 titres -> report_meanrev.html
   python report.py --strategy dip       # repli RSI(3) sur le S&P 500 depuis 1980 -> report_dip.html
-  python report.py --strategy all       # les trois
+  python report.py --strategy sector    # rotation sectorielle + filtre SMA200 depuis 1988 -> report_sector.html
+  python report.py --strategy all       # les quatre
 Options: --start ANNÉE --capital MONTANT. Graphiques Chart.js chargés depuis cdnjs (connexion requise).
 """
 import argparse
@@ -16,9 +17,10 @@ import pandas as pd
 from rotation_satellite import TICKERS, FEE, KILL, load, run
 from meanrev import run_meanrev
 from dip import load_index, run_dip
+from sector import SECTORS, load_sector, run_sector
 
-FILES = {"rotation": "report.html", "meanrev": "report_meanrev.html", "dip": "report_dip.html"}
-TITLES = {"rotation": "ROTATION", "meanrev": "REPLI RSI · 25 TITRES", "dip": "REPLI RSI(3) · S&P 500"}
+FILES = {"rotation": "report.html", "meanrev": "report_meanrev.html", "dip": "report_dip.html", "sector": "report_sector.html"}
+TITLES = {"rotation": "ROTATION", "meanrev": "REPLI RSI · 25 TITRES", "dip": "REPLI RSI(3) · S&P 500", "sector": "ROTATION SECTORIELLE"}
 
 
 def fnum(x, nd=2):
@@ -41,6 +43,10 @@ def prepare(name, a, cache):
             cache["stocks"] = load(TICKERS, min(start, 2001))
         px = cache["stocks"]
         prices, bench = px.drop(columns="SPY"), px["SPY"]
+    elif name == "sector":
+        start = a.start or 1988
+        prices = load_sector(min(start, 1988) - 4)
+        bench = prices["VFINX"]
     else:
         start = a.start or 1980
         idx = load_index(start)
@@ -69,6 +75,19 @@ def prepare(name, a, cache):
                     assumptions="signal à la clôture, achat à la clôture suivante · fractions d'action · aucun impôt ni change · univers à biais de survivant",
                     note="Capital partagé entre 5 positions maximum.", compound=False)
         lines = lambda t, p: ([round(t["entry_price"] * (1 - kw["stop"]), 2)] * len(p), None)
+    elif name == "sector":
+        kw = dict(score="12m", top=5, regime=True, off="VUSTX")
+        runner = lambda **k: run_sector(prices, start, cap, **{**kw, **k})
+        variants = [(f"momentum {sc} · top {t}", dict(score=sc, top=t)) for sc in ("12m", "6m", "3m", "mix") for t in (3, 5, 7)]
+        variants += [("hors marché = cash", dict(off="CASH")), ("sans filtre SMA200", dict(regime=False))]
+        info = dict(chips=[f"{len(SECTORS)} secteurs US", "1d", "Long", "Top 5 à parts égales", "Mensuel", "Coût 0,10 %"],
+                    universe=" · ".join(SECTORS) + " — obligations : VUSTX", prevlabel="MOMENTUM 12M %", bench_label="S&P 500 TR",
+                    entry=["Fin de mois : les 5 secteurs au meilleur rendement sur 12 mois, 20 % chacun, achat à la clôture suivante"],
+                    exit=["Le secteur sort du top 5 à une fin de mois", "S&P 500 sous sa SMA200 en fin de mois → 100 % obligations du Trésor long terme (VUSTX)",
+                          "Rééquilibrage à parts égales chaque mois", "Coût 0,10 % du montant échangé"],
+                    assumptions="fonds sectoriels Fidelity Select / Vanguard, frais et dividendes inclus · référence : fonds S&P 500 VFINX dividendes réinvestis · fonds encore existants (biais de survivant) · aucun impôt",
+                    note="Le P/L par trade inclut les achats et ventes de rééquilibrage mensuel.", compound=False)
+        lines = lambda t, p: (None, None)
     else:
         kw = dict(n=3, thr=20, trend=200, tp=0.01, stop=0.05, maxd=20)
         runner = lambda **k: run_dip(prices.iloc[:, 0], start, cap, **{**kw, **k})
@@ -269,7 +288,7 @@ def build(name, a, cache):
     reasons = {}
     for _, t in tr.iterrows():
         why = str(t.exit_reason)
-        k = "Stop" if why.startswith("stop") else "Cible" if why.startswith("cible") else {"rotation": "Rotation", "ouverte": "Ouverte"}.get(why, why)
+        k = "Stop" if why.startswith("stop") else "Cible" if why.startswith("cible") else "Filtre SMA200" if why.startswith("filtre") else "Sortie du top" if why.startswith("sortie") else {"rotation": "Rotation", "ouverte": "Ouverte"}.get(why, why)
         g = reasons.setdefault(k, {"n": 0, "w": 0, "pnl": 0.0})
         g["n"] += 1; g["w"] += int(t.net > 0); g["pnl"] += float(t.pnl)
 
@@ -471,12 +490,12 @@ bars('#c6',['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','D
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--strategy", choices=["rotation", "meanrev", "dip", "all"], default="rotation")
-    ap.add_argument("--start", type=int, default=None, help="année de départ (défaut : 2001, ou 1980 pour dip)")
+    ap.add_argument("--strategy", choices=["rotation", "meanrev", "dip", "sector", "all"], default="rotation")
+    ap.add_argument("--start", type=int, default=None, help="année de départ (défaut : 2001 ; 1980 pour dip ; 1988 pour sector)")
     ap.add_argument("--capital", type=float, default=10000)
     a = ap.parse_args()
     cache = {}
-    for name in (["rotation", "meanrev", "dip"] if a.strategy == "all" else [a.strategy]):
+    for name in (["rotation", "meanrev", "dip", "sector"] if a.strategy == "all" else [a.strategy]):
         print(f"{name} : calcul en cours…")
         data = build(name, a, cache)
         with open(FILES[name], "w", encoding="utf-8") as fh:
