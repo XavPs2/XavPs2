@@ -19,8 +19,8 @@ from meanrev import run_meanrev
 from dip import load_index, run_dip
 from sector import SECTORS, load_sector, run_sector
 
-FILES = {"rotation": "report.html", "meanrev": "report_meanrev.html", "dip": "report_dip.html", "sector": "report_sector.html"}
-TITLES = {"rotation": "ROTATION", "meanrev": "REPLI RSI · 25 TITRES", "dip": "REPLI RSI(3) · S&P 500", "sector": "ROTATION SECTORIELLE"}
+FILES = {"rotation": "report.html", "meanrev": "report_meanrev.html", "dip": "report_dip.html", "sector": "report_sector.html", "forecast": "report_forecast.html"}
+TITLES = {"rotation": "ROTATION", "meanrev": "REPLI RSI · 25 TITRES", "dip": "REPLI RSI(3) · S&P 500", "sector": "ROTATION SECTORIELLE", "forecast": "PERSPECTIVES 36 MOIS"}
 
 
 def fnum(x, nd=2):
